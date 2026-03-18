@@ -1,34 +1,47 @@
 # Ultron
 
-Node.js + Express + MongoDB backend for FC Food App order management.
+Node.js + Express backend for FC Food App.
+
+Current storage:
+
+- Supabase (Postgres) for: menu items, orders + order items, tables, settings
+- Supabase Storage for: menu item images
+- MongoDB is still used for any routes not migrated yet (e.g. categories)
 
 ## Stack
 
 - Node.js
 - Express
-- MongoDB (Mongoose)
+- Supabase (Postgres + Storage)
+- MongoDB (Mongoose) for non-migrated resources
 
 ## Quick Start
 
 1. Install dependencies:
 
-	 ```bash
-	 npm install
-	 ```
+   ```bash
+   npm install
+   ```
 
 2. Create your environment file:
 
-	 ```bash
-	 copy .env.example .env
-	 ```
+   ```bash
+   copy .env.example .env
+   ```
 
 3. Update `MONGO_URI` in `.env`.
 
-4. Start development server:
+4. Create the Supabase tables:
+   - Run the SQL in `supabase/schema.sql` in the Supabase SQL editor.
+   - Create a public Storage bucket named `menu-images`.
 
-	 ```bash
-	 npm run dev
-	 ```
+5. Update Supabase env vars in `.env`.
+
+6. Start development server:
+
+   ```bash
+   npm run dev
+   ```
 
 The API runs at `http://localhost:5000` by default.
 
@@ -36,6 +49,10 @@ The API runs at `http://localhost:5000` by default.
 
 - `PORT` - API port (default: `5000`)
 - `MONGO_URI` - MongoDB connection string
+- `SUPABASE_URL` - Supabase project URL
+- `SUPABASE_SERVICE_ROLE_KEY` - Supabase service role key (server-side only)
+- `SUPABASE_MENU_IMAGES_BUCKET` - Storage bucket name (default: `menu-images`)
+- `ADMIN_EMAIL`, `ADMIN_PASSWORD` - default admin credentials (used only if settings row doesn't exist yet)
 
 ## Data Models
 
@@ -77,22 +94,22 @@ Base URL: `/api`
 
 ```json
 {
-	"user_id": "U-1001",
-	"table_id": "T-04",
-	"status": "Pending",
-	"payment_status": "Pending",
-	"items": [
-		{
-			"menu_id": "M-001",
-			"quantity": 2,
-			"price": 8.5
-		},
-		{
-			"menu_id": "M-010",
-			"quantity": 1,
-			"price": 3
-		}
-	]
+  "user_id": "U-1001",
+  "table_id": "T-04",
+  "status": "Pending",
+  "payment_status": "Pending",
+  "items": [
+    {
+      "menu_id": "M-001",
+      "quantity": 2,
+      "price": 8.5
+    },
+    {
+      "menu_id": "M-010",
+      "quantity": 1,
+      "price": 3
+    }
+  ]
 }
 ```
 

@@ -1,5 +1,7 @@
-const { Order, ORDER_STATUSES, PAYMENT_STATUSES } = require("../models/Order");
-const { OrderItem } = require("../models/OrderItem");
+const { ORDER_STATUSES, PAYMENT_STATUSES } = require("../models/Order");
+
+const { getSupabaseClient } = require("../config/supabase");
+const { generatePrefixedId } = require("../utils/ids");
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 20;
@@ -40,6 +42,7 @@ const validateItemsPayload = (items) => {
 
 const buildOrderItemsDocs = (orderId, items) =>
   items.map((item) => ({
+    id: generatePrefixedId("ITEM"),
     order_id: orderId,
     menu_id: item.menu_id.trim(),
     quantity: item.quantity,
@@ -47,13 +50,11 @@ const buildOrderItemsDocs = (orderId, items) =>
   }));
 
 const computeTotalFromItems = (items) =>
-  roundMoney(
-    items.reduce((sum, item) => sum + item.quantity * item.price, 0)
-  );
+  roundMoney(items.reduce((sum, item) => sum + item.quantity * item.price, 0));
 
 const buildOrderResponse = (order, orderItems) => ({
-  ...order.toJSON(),
-  order_items: orderItems.map((item) => item.toJSON()),
+  ...order,
+  order_items: orderItems.map((item) => item),
 });
 
 const groupItemsByOrderId = (items) => {
@@ -70,15 +71,27 @@ const groupItemsByOrderId = (items) => {
 
 const createOrder = async (req, res, next) => {
   try {
-    const { user_id, table_id, status, payment_status, total, items, created_at } =
-      req.body;
+    const supabase = getSupabaseClient();
+    const {
+      user_id,
+      table_id,
+      status,
+      payment_status,
+      total,
+      items,
+      created_at,
+    } = req.body;
 
     if (!user_id || typeof user_id !== "string") {
-      return res.status(400).json({ message: "user_id is required and must be a string." });
+      return res
+        .status(400)
+        .json({ message: "user_id is required and must be a string." });
     }
 
     if (!table_id || typeof table_id !== "string") {
-      return res.status(400).json({ message: "table_id is required and must be a string." });
+      return res
+        .status(400)
+        .json({ message: "table_id is required and must be a string." });
     }
 
     if (status && !ORDER_STATUSES.includes(status)) {
@@ -93,13 +106,17 @@ const createOrder = async (req, res, next) => {
       });
     }
 
-    const itemsError = validateItemsPayload(items);
-    if (itemsError) {
-      return res.status(400).json({ message: itemsError });
+    const itemsValidationError = validateItemsPayload(items);
+    if (itemsValidationError) {
+      return res.status(400).json({ message: itemsValidationError });
     }
 
     if (total !== undefined && (typeof total !== "number" || total < 0)) {
-      return res.status(400).json({ message: "total must be a non-negative number when provided." });
+      return res
+        .status(400)
+        .json({
+          message: "total must be a non-negative number when provided.",
+        });
     }
 
     const computedTotal = computeTotalFromItems(items);
@@ -109,22 +126,41 @@ const createOrder = async (req, res, next) => {
     if (created_at !== undefined) {
       createdAtValue = new Date(created_at);
       if (Number.isNaN(createdAtValue.getTime())) {
-        return res.status(400).json({ message: "created_at must be a valid date." });
+        return res
+          .status(400)
+          .json({ message: "created_at must be a valid date." });
       }
     }
 
-    const order = await Order.create({
-      user_id: user_id.trim(),
-      table_id: table_id.trim(),
-      status: status || "Pending",
-      total: finalTotal,
-      payment_status: payment_status || "Pending",
-      ...(createdAtValue && { created_at: createdAtValue }),
-    });
+    const orderId = generatePrefixedId("ORD");
 
-    const createdItems = await OrderItem.insertMany(
-      buildOrderItemsDocs(order.id, items)
-    );
+    const { data: order, error: orderError } = await supabase
+      .from("orders")
+      .insert({
+        id: orderId,
+        user_id: user_id.trim(),
+        table_id: table_id.trim(),
+        status: status || "Pending",
+        total: finalTotal,
+        payment_status: payment_status || "Pending",
+        ...(createdAtValue && { created_at: createdAtValue.toISOString() }),
+      })
+      .select("*")
+      .single();
+
+    if (orderError) {
+      throw orderError;
+    }
+
+    const itemsPayload = buildOrderItemsDocs(orderId, items);
+    const { data: createdItems, error: itemsError } = await supabase
+      .from("order_items")
+      .insert(itemsPayload)
+      .select("*");
+
+    if (itemsError) {
+      throw itemsError;
+    }
 
     return res.status(201).json({
       message: "Order created successfully.",
@@ -137,6 +173,7 @@ const createOrder = async (req, res, next) => {
 
 const listOrders = async (req, res, next) => {
   try {
+    const supabase = getSupabaseClient();
     const {
       status,
       payment_status,
@@ -162,58 +199,74 @@ const listOrders = async (req, res, next) => {
       });
     }
 
-    const filters = {};
-    if (status) filters.status = status;
-    if (payment_status) filters.payment_status = payment_status;
-    if (user_id) filters.user_id = user_id;
-    if (table_id) filters.table_id = table_id;
+    let query = supabase.from("orders").select("*", { count: "exact" });
 
-    if (from || to) {
-      filters.created_at = {};
+    if (status) query = query.eq("status", status);
+    if (payment_status) query = query.eq("payment_status", payment_status);
+    if (user_id) query = query.eq("user_id", user_id);
+    if (table_id) query = query.eq("table_id", table_id);
 
-      if (from) {
-        const fromDate = new Date(from);
-        if (Number.isNaN(fromDate.getTime())) {
-          return res.status(400).json({ message: "from must be a valid date." });
-        }
-        filters.created_at.$gte = fromDate;
+    if (from) {
+      const fromDate = new Date(from);
+      if (Number.isNaN(fromDate.getTime())) {
+        return res.status(400).json({ message: "from must be a valid date." });
       }
+      query = query.gte("created_at", fromDate.toISOString());
+    }
 
-      if (to) {
-        const toDate = new Date(to);
-        if (Number.isNaN(toDate.getTime())) {
-          return res.status(400).json({ message: "to must be a valid date." });
-        }
-        filters.created_at.$lte = toDate;
+    if (to) {
+      const toDate = new Date(to);
+      if (Number.isNaN(toDate.getTime())) {
+        return res.status(400).json({ message: "to must be a valid date." });
       }
+      query = query.lte("created_at", toDate.toISOString());
     }
 
     const safePage = Math.max(1, Math.floor(toNumber(page, DEFAULT_PAGE)));
     const safeLimit = Math.min(
       MAX_LIMIT,
-      Math.max(1, Math.floor(toNumber(limit, DEFAULT_LIMIT)))
+      Math.max(1, Math.floor(toNumber(limit, DEFAULT_LIMIT))),
     );
     const skip = (safePage - 1) * safeLimit;
 
     const sortField = sort_by === "total" ? "total" : "created_at";
     const sortDirection = sort_order === "asc" ? 1 : -1;
 
-    const [orders, totalCount] = await Promise.all([
-      Order.find(filters)
-        .sort({ [sortField]: sortDirection })
-        .skip(skip)
-        .limit(safeLimit),
-      Order.countDocuments(filters),
-    ]);
+    const rangeFrom = skip;
+    const rangeTo = skip + safeLimit - 1;
 
-    const orderIds = orders.map((order) => order.id);
-    const orderItems = orderIds.length
-      ? await OrderItem.find({ order_id: { $in: orderIds } })
-      : [];
+    const {
+      data: orders,
+      count: totalCount,
+      error,
+    } = await query
+      .order(sortField, { ascending: sortDirection === 1 })
+      .range(rangeFrom, rangeTo);
+
+    if (error) {
+      throw error;
+    }
+
+    const orderIds = (orders || []).map((order) => order.id);
+
+    let orderItems = [];
+
+    if (orderIds.length) {
+      const { data: itemsData, error: itemsError } = await supabase
+        .from("order_items")
+        .select("*")
+        .in("order_id", orderIds);
+
+      if (itemsError) {
+        throw itemsError;
+      }
+
+      orderItems = itemsData || [];
+    }
 
     const groupedItems = groupItemsByOrderId(orderItems);
-    const data = orders.map((order) =>
-      buildOrderResponse(order, groupedItems.get(order.id) || [])
+    const data = (orders || []).map((order) =>
+      buildOrderResponse(order, groupedItems.get(order.id) || []),
     );
 
     return res.status(200).json({
@@ -221,8 +274,8 @@ const listOrders = async (req, res, next) => {
       pagination: {
         page: safePage,
         limit: safeLimit,
-        total: totalCount,
-        total_pages: Math.ceil(totalCount / safeLimit),
+        total: totalCount || 0,
+        total_pages: Math.ceil((totalCount || 0) / safeLimit),
       },
     });
   } catch (error) {
@@ -232,14 +285,30 @@ const listOrders = async (req, res, next) => {
 
 const getOrderById = async (req, res, next) => {
   try {
+    const supabase = getSupabaseClient();
     const { id } = req.params;
 
-    const order = await Order.findOne({ id });
+    const { data: order, error } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("id", id)
+      .maybeSingle();
+
+    if (error) {
+      throw error;
+    }
     if (!order) {
       return res.status(404).json({ message: "Order not found." });
     }
 
-    const orderItems = await OrderItem.find({ order_id: id });
+    const { data: orderItems, error: itemsError } = await supabase
+      .from("order_items")
+      .select("*")
+      .eq("order_id", id);
+
+    if (itemsError) {
+      throw itemsError;
+    }
 
     return res.status(200).json({
       data: buildOrderResponse(order, orderItems),
@@ -251,8 +320,10 @@ const getOrderById = async (req, res, next) => {
 
 const updateOrder = async (req, res, next) => {
   try {
+    const supabase = getSupabaseClient();
     const { id } = req.params;
-    const { user_id, table_id, status, payment_status, total, items } = req.body;
+    const { user_id, table_id, status, payment_status, total, items } =
+      req.body;
 
     const hasUpdatableField =
       user_id !== undefined ||
@@ -269,17 +340,35 @@ const updateOrder = async (req, res, next) => {
       });
     }
 
-    const existingOrder = await Order.findOne({ id });
+    const { data: existingOrder, error: existingError } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("id", id)
+      .maybeSingle();
+
+    if (existingError) {
+      throw existingError;
+    }
     if (!existingOrder) {
       return res.status(404).json({ message: "Order not found." });
     }
 
-    if (user_id !== undefined && (typeof user_id !== "string" || !user_id.trim())) {
-      return res.status(400).json({ message: "user_id must be a non-empty string." });
+    if (
+      user_id !== undefined &&
+      (typeof user_id !== "string" || !user_id.trim())
+    ) {
+      return res
+        .status(400)
+        .json({ message: "user_id must be a non-empty string." });
     }
 
-    if (table_id !== undefined && (typeof table_id !== "string" || !table_id.trim())) {
-      return res.status(400).json({ message: "table_id must be a non-empty string." });
+    if (
+      table_id !== undefined &&
+      (typeof table_id !== "string" || !table_id.trim())
+    ) {
+      return res
+        .status(400)
+        .json({ message: "table_id must be a non-empty string." });
     }
 
     if (status !== undefined && !ORDER_STATUSES.includes(status)) {
@@ -288,20 +377,25 @@ const updateOrder = async (req, res, next) => {
       });
     }
 
-    if (payment_status !== undefined && !PAYMENT_STATUSES.includes(payment_status)) {
+    if (
+      payment_status !== undefined &&
+      !PAYMENT_STATUSES.includes(payment_status)
+    ) {
       return res.status(400).json({
         message: `payment_status must be one of: ${PAYMENT_STATUSES.join(", ")}.`,
       });
     }
 
     if (total !== undefined && (typeof total !== "number" || total < 0)) {
-      return res.status(400).json({ message: "total must be a non-negative number." });
+      return res
+        .status(400)
+        .json({ message: "total must be a non-negative number." });
     }
 
     if (items !== undefined) {
-      const itemsError = validateItemsPayload(items);
-      if (itemsError) {
-        return res.status(400).json({ message: itemsError });
+      const itemsValidationError = validateItemsPayload(items);
+      if (itemsValidationError) {
+        return res.status(400).json({ message: itemsValidationError });
       }
     }
 
@@ -314,8 +408,26 @@ const updateOrder = async (req, res, next) => {
     let responseOrderItems = null;
 
     if (items !== undefined) {
-      await OrderItem.deleteMany({ order_id: id });
-      responseOrderItems = await OrderItem.insertMany(buildOrderItemsDocs(id, items));
+      const { error: deleteError } = await supabase
+        .from("order_items")
+        .delete()
+        .eq("order_id", id);
+
+      if (deleteError) {
+        throw deleteError;
+      }
+
+      const itemsPayload = buildOrderItemsDocs(id, items);
+      const { data: insertedItems, error: insertError } = await supabase
+        .from("order_items")
+        .insert(itemsPayload)
+        .select("*");
+
+      if (insertError) {
+        throw insertError;
+      }
+
+      responseOrderItems = insertedItems;
 
       const computedTotal = computeTotalFromItems(items);
       updates.total = total !== undefined ? roundMoney(total) : computedTotal;
@@ -323,14 +435,28 @@ const updateOrder = async (req, res, next) => {
       updates.total = roundMoney(total);
     }
 
-    const updatedOrder = await Order.findOneAndUpdate(
-      { id },
-      { $set: updates },
-      { new: true, runValidators: true }
-    );
+    const { data: updatedOrder, error: updateError } = await supabase
+      .from("orders")
+      .update(updates)
+      .eq("id", id)
+      .select("*")
+      .maybeSingle();
+
+    if (updateError) {
+      throw updateError;
+    }
 
     if (!responseOrderItems) {
-      responseOrderItems = await OrderItem.find({ order_id: id });
+      const { data: orderItems, error: itemsError } = await supabase
+        .from("order_items")
+        .select("*")
+        .eq("order_id", id);
+
+      if (itemsError) {
+        throw itemsError;
+      }
+
+      responseOrderItems = orderItems;
     }
 
     return res.status(200).json({
@@ -344,6 +470,7 @@ const updateOrder = async (req, res, next) => {
 
 const updateOrderStatus = async (req, res, next) => {
   try {
+    const supabase = getSupabaseClient();
     const { id } = req.params;
     const { status } = req.body;
 
@@ -353,17 +480,29 @@ const updateOrderStatus = async (req, res, next) => {
       });
     }
 
-    const order = await Order.findOneAndUpdate(
-      { id },
-      { $set: { status } },
-      { new: true, runValidators: true }
-    );
+    const { data: order, error } = await supabase
+      .from("orders")
+      .update({ status })
+      .eq("id", id)
+      .select("*")
+      .maybeSingle();
+
+    if (error) {
+      throw error;
+    }
 
     if (!order) {
       return res.status(404).json({ message: "Order not found." });
     }
 
-    const orderItems = await OrderItem.find({ order_id: id });
+    const { data: orderItems, error: itemsError } = await supabase
+      .from("order_items")
+      .select("*")
+      .eq("order_id", id);
+
+    if (itemsError) {
+      throw itemsError;
+    }
 
     return res.status(200).json({
       message: "Order status updated successfully.",
@@ -376,6 +515,7 @@ const updateOrderStatus = async (req, res, next) => {
 
 const updatePaymentStatus = async (req, res, next) => {
   try {
+    const supabase = getSupabaseClient();
     const { id } = req.params;
     const { payment_status } = req.body;
 
@@ -385,17 +525,29 @@ const updatePaymentStatus = async (req, res, next) => {
       });
     }
 
-    const order = await Order.findOneAndUpdate(
-      { id },
-      { $set: { payment_status } },
-      { new: true, runValidators: true }
-    );
+    const { data: order, error } = await supabase
+      .from("orders")
+      .update({ payment_status })
+      .eq("id", id)
+      .select("*")
+      .maybeSingle();
+
+    if (error) {
+      throw error;
+    }
 
     if (!order) {
       return res.status(404).json({ message: "Order not found." });
     }
 
-    const orderItems = await OrderItem.find({ order_id: id });
+    const { data: orderItems, error: itemsError } = await supabase
+      .from("order_items")
+      .select("*")
+      .eq("order_id", id);
+
+    if (itemsError) {
+      throw itemsError;
+    }
 
     return res.status(200).json({
       message: "Payment status updated successfully.",
@@ -408,18 +560,34 @@ const updatePaymentStatus = async (req, res, next) => {
 
 const getOrderItems = async (req, res, next) => {
   try {
+    const supabase = getSupabaseClient();
     const { id } = req.params;
 
-    const order = await Order.findOne({ id });
+    const { data: order, error } = await supabase
+      .from("orders")
+      .select("id")
+      .eq("id", id)
+      .maybeSingle();
+
+    if (error) {
+      throw error;
+    }
     if (!order) {
       return res.status(404).json({ message: "Order not found." });
     }
 
-    const orderItems = await OrderItem.find({ order_id: id });
+    const { data: orderItems, error: itemsError } = await supabase
+      .from("order_items")
+      .select("*")
+      .eq("order_id", id);
+
+    if (itemsError) {
+      throw itemsError;
+    }
 
     return res.status(200).json({
       order_id: id,
-      order_items: orderItems.map((item) => item.toJSON()),
+      order_items: (orderItems || []).map((item) => item),
     });
   } catch (error) {
     return next(error);
@@ -428,19 +596,36 @@ const getOrderItems = async (req, res, next) => {
 
 const deleteOrder = async (req, res, next) => {
   try {
+    const supabase = getSupabaseClient();
     const { id } = req.params;
 
-    const deletedOrder = await Order.findOneAndDelete({ id });
+    const { count: deletedItemsCount, error: countError } = await supabase
+      .from("order_items")
+      .select("id", { count: "exact", head: true })
+      .eq("order_id", id);
+
+    if (countError) {
+      throw countError;
+    }
+
+    const { data: deletedOrder, error } = await supabase
+      .from("orders")
+      .delete()
+      .eq("id", id)
+      .select("id")
+      .maybeSingle();
+
+    if (error) {
+      throw error;
+    }
     if (!deletedOrder) {
       return res.status(404).json({ message: "Order not found." });
     }
 
-    const deletedItems = await OrderItem.deleteMany({ order_id: id });
-
     return res.status(200).json({
       message: "Order deleted successfully.",
       deleted_order_id: id,
-      deleted_order_items: deletedItems.deletedCount,
+      deleted_order_items: deletedItemsCount || 0,
     });
   } catch (error) {
     return next(error);

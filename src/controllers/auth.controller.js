@@ -1,30 +1,52 @@
-const { AppSetting, DEFAULT_SETTINGS } = require("../models/AppSetting");
+const { DEFAULT_SETTINGS } = require("../models/AppSetting");
+
+const { getSupabaseClient } = require("../config/supabase");
 
 const SETTINGS_ID = "default";
 
 const login = async (req, res, next) => {
   try {
+    const supabase = getSupabaseClient();
     const { email, password } = req.body;
 
     if (!email || typeof email !== "string" || !email.trim()) {
-      return res.status(400).json({ message: "email is required and must be a non-empty string." });
+      return res
+        .status(400)
+        .json({ message: "email is required and must be a non-empty string." });
     }
 
     if (!password || typeof password !== "string") {
-      return res.status(400).json({ message: "password is required and must be a string." });
+      return res
+        .status(400)
+        .json({ message: "password is required and must be a string." });
     }
 
-    const settings = await AppSetting.findOne({ id: SETTINGS_ID });
+    const { data: settings, error } = await supabase
+      .from("app_settings")
+      .select("admin_email, two_factor_enabled, admin_password")
+      .eq("id", SETTINGS_ID)
+      .maybeSingle();
+
+    if (error) {
+      throw error;
+    }
 
     const storedEmail =
-      settings?.admin_email || process.env.ADMIN_EMAIL || DEFAULT_SETTINGS.admin_email;
+      settings?.admin_email ||
+      process.env.ADMIN_EMAIL ||
+      DEFAULT_SETTINGS.admin_email;
     const storedPassword =
-      settings?.admin_password || process.env.ADMIN_PASSWORD || DEFAULT_SETTINGS.admin_password;
+      settings?.admin_password ||
+      process.env.ADMIN_PASSWORD ||
+      DEFAULT_SETTINGS.admin_password;
 
     const normalizedInputEmail = email.trim().toLowerCase();
     const normalizedStoredEmail = String(storedEmail).trim().toLowerCase();
 
-    if (normalizedInputEmail !== normalizedStoredEmail || password !== storedPassword) {
+    if (
+      normalizedInputEmail !== normalizedStoredEmail ||
+      password !== storedPassword
+    ) {
       return res.status(401).json({ message: "Invalid email or password." });
     }
 
